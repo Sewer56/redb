@@ -2,9 +2,11 @@ use redb::{AccessGuard, ReadableTableMetadata, TableDefinition};
 use rocksdb::{Direction, IteratorMode, TransactionDB, TransactionOptions, WriteOptions};
 use sanakirja::btree::page_unsized;
 use sanakirja::{Commit, RootDb};
-use std::fs;
+use std::fs::{self, create_dir_all, read_dir, remove_file, ReadDir};
 use std::fs::File;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
 const X: TableDefinition<&[u8], &[u8]> = TableDefinition::new("x");
@@ -708,5 +710,148 @@ impl<'db, 'txn> BenchIterator for SanakirjaBenchIterator<'db, 'txn> {
             let x = x.unwrap();
             (x.0, x.1)
         })
+    }
+}
+
+pub struct FileSystemBenchDatabase {
+    dir: PathBuf,
+}
+
+impl FileSystemBenchDatabase {
+    pub fn new(dir: &Path) -> Self {
+        create_dir_all(dir).unwrap();
+        FileSystemBenchDatabase {
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    fn key_to_path(&self, key: &[u8]) -> PathBuf {
+        let hex_key = hex::encode(key);
+        self.dir.join(hex_key)
+    }
+}
+
+impl BenchDatabase for FileSystemBenchDatabase {
+    type W<'db> = FileSystemBenchWriteTransaction<'db> where Self: 'db;
+    type R<'db> = FileSystemBenchReadTransaction<'db> where Self: 'db;
+
+    fn db_type_name() -> &'static str {
+        "filesystem"
+    }
+
+    fn write_transaction(&self) -> Self::W<'_> {
+        FileSystemBenchWriteTransaction { db: self }
+    }
+
+    fn read_transaction(&self) -> Self::R<'_> {
+        FileSystemBenchReadTransaction { db: self }
+    }
+}
+
+pub struct FileSystemBenchWriteTransaction<'db> {
+    db: &'db FileSystemBenchDatabase,
+}
+
+impl<'db> BenchWriteTransaction for FileSystemBenchWriteTransaction<'db> {
+    type W<'txn> = FileSystemBenchInserter<'db> where Self: 'txn;
+
+    fn get_inserter(&mut self) -> Self::W<'_> {
+        FileSystemBenchInserter { db: self.db }
+    }
+
+    fn commit(self) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+pub struct FileSystemBenchInserter<'db> {
+    db: &'db FileSystemBenchDatabase,
+}
+
+impl<'db> BenchInserter for FileSystemBenchInserter<'db> {
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), ()> {
+        let path = self.db.key_to_path(key);
+        let mut file = File::create(path).map_err(|_| ())?;
+        file.write_all(value).map_err(|_| ())
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Result<(), ()> {
+        let path = self.db.key_to_path(key);
+        remove_file(path).map_err(|_| ())
+    }
+}
+
+pub struct FileSystemBenchReadTransaction<'db> {
+    db: &'db FileSystemBenchDatabase,
+}
+
+impl<'db> BenchReadTransaction for FileSystemBenchReadTransaction<'db> {
+    type T<'txn> = FileSystemBenchReader<'db> where Self: 'txn;
+
+    fn get_reader(&self) -> Self::T<'_> {
+        FileSystemBenchReader { db: self.db }
+    }
+}
+
+pub struct FileSystemBenchReader<'db> {
+    db: &'db FileSystemBenchDatabase,
+}
+
+impl<'db> BenchReader for FileSystemBenchReader<'db> {
+    type Output<'out> = Vec<u8> where Self: 'out;
+    type Iterator<'out> = FileSystemBenchIterator<'out> where Self: 'out;
+
+    fn get(&self, key: &[u8]) -> Option<Self::Output<'_>> {
+        let path = self.db.key_to_path(key);
+        if path.exists() {
+            let mut file = File::open(path).ok()?;
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer).ok()?;
+            Some(buffer)
+        } else {
+            None
+        }
+    }
+
+    fn range_from<'a>(&'a self, start: &'a [u8]) -> Self::Iterator<'a> {
+        let start_path = self.db.key_to_path(start);
+        FileSystemBenchIterator {
+            iter: read_dir(&self.db.dir).unwrap(),
+            start_path,
+            _phantom: PhantomData,
+        }
+    }
+
+    fn len(&self) -> u64 {
+        read_dir(&self.db.dir)
+            .map(|entries| entries.count() as u64)
+            .unwrap_or(0)
+    }
+}
+
+pub struct FileSystemBenchIterator<'a> {
+    iter: ReadDir,
+    start_path: PathBuf,
+    _phantom: PhantomData<&'a ()>,
+}
+
+impl<'a> BenchIterator for FileSystemBenchIterator<'a> {
+    type Output<'out> = Vec<u8> where Self: 'out;
+
+    fn next(&mut self) -> Option<(Self::Output<'_>, Self::Output<'_>)> {
+        loop {
+            let entry = self.iter.next()?;
+            let path = entry.ok()?.path();
+            if path < self.start_path {
+                continue;
+            }
+            let file_name = path.file_name()?.to_str()?;
+            let key = hex::decode(file_name).ok()?;
+            let mut file = File::open(&path).ok()?;
+            let mut value = Vec::new();
+            file.read_to_end(&mut value).ok()?;
+
+            return Some((key, value));
+        }
     }
 }

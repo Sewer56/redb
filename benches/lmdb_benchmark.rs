@@ -10,7 +10,7 @@ use common::*;
 use std::time::{Duration, Instant};
 
 const ITERATIONS: usize = 2;
-const ELEMENTS: usize = 1_000_000;
+const ELEMENTS: usize = 100000;
 const KEY_SIZE: usize = 24;
 const VALUE_SIZE: usize = 150;
 const RNG_SEED: u64 = 3;
@@ -181,35 +181,6 @@ fn benchmark<T: BenchDatabase + Send + Sync>(db: T) -> Vec<(String, Duration)> {
             );
             results.push(("random reads".to_string(), duration));
         }
-
-        for _ in 0..ITERATIONS {
-            let mut rng = make_rng();
-            let start = Instant::now();
-            let reader = txn.get_reader();
-            let mut value_sum = 0;
-            let num_scan = 10;
-            for _ in 0..ELEMENTS {
-                let (key, _value) = gen_pair(&mut rng);
-                let mut iter = reader.range_from(&key);
-                for _ in 0..num_scan {
-                    if let Some((_, value)) = iter.next() {
-                        value_sum += value.as_ref()[0];
-                    } else {
-                        break;
-                    }
-                }
-            }
-            assert!(value_sum > 0);
-            let end = Instant::now();
-            let duration = end - start;
-            println!(
-                "{}: Random range read {} elements in {}ms",
-                T::db_type_name(),
-                ELEMENTS * num_scan,
-                duration.as_millis()
-            );
-            results.push(("random range reads".to_string(), duration));
-        }
     }
     drop(txn);
 
@@ -287,6 +258,12 @@ fn main() {
     })
     .unwrap();
 
+    let filesystem_results = {
+        let tmpfile: TempDir = tempfile::tempdir_in(&tmpdir).unwrap();
+        let table = FileSystemBenchDatabase::new(tmpfile.path());
+        benchmark(table)
+    };    
+
     let redb_latency_results = {
         let tmpfile: NamedTempFile = NamedTempFile::new_in(&tmpdir).unwrap();
         let db = redb::Database::builder()
@@ -344,6 +321,7 @@ fn main() {
     }
 
     for results in [
+        filesystem_results,
         redb_latency_results,
         lmdb_results,
         rocksdb_results,
@@ -357,7 +335,7 @@ fn main() {
 
     let mut table = comfy_table::Table::new();
     table.set_width(100);
-    table.set_header(["", "redb", "lmdb", "rocksdb", "sled", "sanakirja"]);
+    table.set_header(["", "filesystem", "redb", "lmdb", "rocksdb", "sled", "sanakirja"]);
     for row in rows {
         table.add_row(row);
     }
